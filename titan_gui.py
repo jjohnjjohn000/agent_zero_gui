@@ -7,6 +7,7 @@ import time
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ['PYTORCH_HIP_ALLOC_CONF'] = 'expandable_segments:True'
 
 import multiprocessing
 
@@ -34,7 +35,7 @@ from matplotlib.figure import Figure
 class TitanGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("TITAN VAE - Training Control Center (v3.3 Stable)")
+        self.root.title("TITAN V4.0 - PERCEPTUAL VAE (Stable)")
         self.root.geometry("1450x900")
         
         # Graceful Exit
@@ -63,12 +64,12 @@ class TitanGUI:
 
     def build_left_panel(self):
         pad = {'padx': 10, 'pady': 5}
-        tk.Label(self.left_panel, text="🚀 TITAN CONTROL", font=("Helvetica", 16, "bold"), fg="#c0392b").pack(pady=15)
+        tk.Label(self.left_panel, text="👁 TITAN PERCEPTUAL", font=("Helvetica", 16, "bold"), fg="#8e44ad").pack(pady=15)
         
         f_act = ttk.LabelFrame(self.left_panel, text="Actions")
         f_act.pack(fill="x", **pad)
         
-        self.btn_start = tk.Button(f_act, text="▶ START TRAINING", bg="#2ecc71", fg="black", font=("Arial", 11, "bold"), command=self.start_training)
+        self.btn_start = tk.Button(f_act, text="▶ START NEW RUN", bg="#2ecc71", fg="black", font=("Arial", 11, "bold"), command=self.start_training)
         self.btn_start.pack(fill="x", padx=5, pady=5)
         
         self.btn_stop = tk.Button(f_act, text="⏹ STOP ENGINE", bg="#e74c3c", fg="white", font=("Arial", 11, "bold"), command=self.stop_training, state="disabled")
@@ -80,8 +81,8 @@ class TitanGUI:
         
         self.vars = {}
         defaults = {
-            "LEARNING_RATE": 8e-5, "BATCH_SIZE": 36, "LATENT_DIM": 2048,
-            "EPOCHS": 130, "EDGE_WEIGHT": 500.0, "CHROMA_WEIGHT": 30.0, "BETA": 0.00001
+            "LEARNING_RATE": 0.00005, "BATCH_SIZE": 4, "LATENT_DIM": 4096,
+            "EPOCHS": 150, "PERCEPTUAL_WEIGHT": 2.0, "CHROMA_WEIGHT": 30.0, "BETA": 0.00001
         }
         
         row = 0
@@ -122,9 +123,9 @@ class TitanGUI:
         # Graph
         self.fig = Figure(figsize=(6, 5), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("Training Loss")
+        self.ax.set_title("VGG Perceptual Loss")
         self.ax.grid(True, alpha=0.3)
-        self.line, = self.ax.plot([], [], 'b-', linewidth=1.5)
+        self.line, = self.ax.plot([], [], 'm-', linewidth=1.5) # Magenta for Perceptual
         
         # --- SAFE IMPORT: Import Backend ONLY when needed ---
         try:
@@ -171,7 +172,7 @@ class TitanGUI:
             
             self.btn_start.config(state="disabled")
             self.btn_stop.config(state="normal")
-            self.lbl_status_main.config(text="STARTING...", fg="#e67e22")
+            self.lbl_status_main.config(text="STARTING...", fg="#8e44ad")
             self.loss_history = []
             self.line.set_data([], [])
             self.canvas.draw()
@@ -195,13 +196,17 @@ class TitanGUI:
                     elif msg_type == "TRAINING":
                         loss = data.get("loss")
                         self.lbl_status_main.config(text=f"LOSS: {loss:.4f}", fg="blue")
-                        self.lbl_details.config(text=f"Epoch: {data.get('epoch')} | Iter: {data.get('iteration')}")
+                        
+                        # --- V4 UPDATE: SHOW PERCEPTUAL WEIGHT ---
+                        perc_val = data.get('perc', 0.0)
+                        self.lbl_details.config(text=f"Epoch: {data.get('epoch')} | PercW: {perc_val:.2f}")
                         
                         # --- SYNC HYPERPARAMETERS WITH LIVE ENGINE ---
                         if "lr" in data: 
                             self.vars["LEARNING_RATE"].set(data["lr"])
-                        if "edge_weight" in data: 
-                            self.vars["EDGE_WEIGHT"].set(data["edge_weight"])
+                        # Check for 'perc' instead of 'edge_weight'
+                        if "perc" in data: 
+                            self.vars["PERCEPTUAL_WEIGHT"].set(data["perc"])
                         if "beta" in data: 
                             self.vars["BETA"].set(data["beta"])
                         # ---------------------------------------------

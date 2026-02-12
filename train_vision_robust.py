@@ -1,6 +1,6 @@
 """
 =============================================================================
-TITAN ENGINE v3.1 - VISION TRAINING SYSTEM (ULTRA ROBUST & THREADED)
+TITAN ENGINE v4.0 - VISION TRAINING SYSTEM (ULTRA ROBUST & THREADED)
 =============================================================================
 Conçu pour l'entraînement haute performance sur GPU AMD (ROCm) avec 12 Go VRAM.
 Optimisé pour le traitement de datasets massifs (21 Go+) par segmentation 
@@ -71,18 +71,19 @@ except ImportError:
 # --- DEFAULTS & GLOBALS ---
 # =============================================================================
 DEFAULT_CONFIG = {
-    "LEARNING_RATE": 8e-5,
-    "BATCH_SIZE": 32,
-    "LATENT_DIM": 2048,
-    "CROP_SIZE": 128,
-    "EPOCHS": 130,
+    "LEARNING_RATE": 5e-5,
+    "BATCH_SIZE": 4,
+    "LATENT_DIM": 4096,
+    "CROP_SIZE": 256,
+    "EPOCHS": 150,
     "NUM_THREADS": 6,
-    "MAX_IMAGES_PER_POOL": 12000,
+    "MAX_IMAGES_PER_POOL": 4000,
     "MIN_SYS_RAM_GB": 4.0,
-    "FILES_PER_LOAD": 16,
-    "EDGE_WEIGHT": 500.0,
+    "FILES_PER_LOAD": 10,
+    "PERCEPTUAL_WEIGHT": 1.0, # NEW: Replaces Edge Weight
+    "EDGE_WEIGHT": 0.0,       # Deprecated
     "CHROMA_WEIGHT": 30.0,
-    "BETA": 0.0,
+    "BETA": 0.00001,
     "VISUALIZE_EVERY_N_POOLS": 2,
     "CHECKPOINT_EVERY_N_POOLS": 1,
     "DATA_DIR": os.path.join(project_root, "data"),
@@ -252,9 +253,14 @@ def load_titan_checkpoint(model, optimizer, cfg):
     if os.path.exists(weights_path):
         try:
             checkpoint = torch.load(weights_path, map_location='cpu')
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            logger.info(" >>> [LOAD] Poids neuronaux restaurés.")
+            # Try loading weights. If architecture changed (V3->V4), this will fail.
+            try:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                logger.info(" >>> [LOAD] Poids neuronaux restaurés.")
+            except RuntimeError as e:
+                logger.warning(f" >>> [ARCH CHANGE DETECTED] Weights mismatch (V4 Upgrade). Starting Fresh. {e}")
+                return 0, 0
         except Exception as e:
             logger.error(f"Échec restauration poids : {e}")
 
@@ -294,6 +300,8 @@ def train_process_entrypoint(status_queue, stop_event, config_overrides):
     C'est ici que tout se passe.
     """
     
+    local_stop_event = threading.Event() 
+
     # 1. CONFIGURATION
     cfg = DEFAULT_CONFIG.copy()
     if config_overrides:
@@ -318,13 +326,13 @@ def train_process_entrypoint(status_queue, stop_event, config_overrides):
     qh = QueueLogger(status_queue)
     logger.addHandler(qh)
     
-    logger.info("TITAN ENGINE PROCESS STARTED.")
+    logger.info("TITAN ENGINE V4.0 STARTED.")
     
     try:
         # 3. INITIALIZATION MATÉRIELLE (DELAYED IMPORT)
         # Import local pour éviter les crashs si importé globalement
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"TITAN ENGINE v3.1 INITIALISÉ SUR : {device}")
+        logger.info(f"TITAN ENGINE INITIALISÉ SUR : {device}")
         
         # 4. CONSTRUCTION DU MODÈLE
         model = VAE(latent_dim=cfg["LATENT_DIM"]).to(device)
@@ -333,13 +341,21 @@ def train_process_entrypoint(status_queue, stop_event, config_overrides):
         # 5. RESTAURATION DE SESSION
         start_epoch, start_file_ptr = load_titan_checkpoint(model, optimizer, cfg)
         
+        # --- CRITICAL FIX: FORCE GUI LEARNING RATE ---
+        # Overwrite the checkpoint's stored LR with the fresh value from the GUI
+        current_gui_lr = cfg["LEARNING_RATE"]
+        logger.info(f" >>> [INIT] Overriding LR to GUI Value: {current_gui_lr}")
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_gui_lr
+        
         # Sanity Check
         logger.info(">>> Lancement du Sanity Check...")
         try:
             dummy = torch.randn(1, 3, cfg["CROP_SIZE"], cfg["CROP_SIZE"]).to(device)
             with torch.amp.autocast('cuda'):
                 recon, mu, logvar = model(dummy)
-                loss = vae_loss_function(recon, dummy, mu, logvar, 0.0, 10.0, 10.0)
+                # FIX: Added 9th argument (perceptual_weight=0.0)
+                loss = vae_loss_function(recon, dummy, mu, logvar, 0.0, 0.0, 0.0, 0.0, 0.0)
             loss.backward()
             optimizer.zero_grad(set_to_none=True)
             logger.info(">>> Sanity Check RÉUSSI.")
@@ -352,7 +368,8 @@ def train_process_entrypoint(status_queue, stop_event, config_overrides):
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=5, verbose=True
         )
-        scaler = torch.amp.GradScaler('cuda')
+        # FIX: Set a lower initial scale and lower growth factor
+        scaler = torch.amp.GradScaler('cuda', init_scale=1024.0, growth_interval=2000)
         torch.backends.cudnn.benchmark = True 
         
         # 6. PRÉPARATION DU DATASET
@@ -381,193 +398,230 @@ def train_process_entrypoint(status_queue, stop_event, config_overrides):
         
         status_queue.put({"status": "RUNNING", "msg": "Training Loop Active"})
         
-        phases_reset_done = {5: False, 15: False, 25: False} # Flags to ensure we reset only once
+        # --- PHASE CONTROL FLAGS ---
+        phases_reset_done = {5: False, 15: False, 30: False}
 
+        # =============================================================================
         # 8. BOUCLE MAITRESSE (THE INFINITE BURN)
+        # =============================================================================
+        pool_counter = 0
+        last_loop_ptr = start_file_ptr
+        phases_reset_done = {5: False, 15: False, 30: False}
+
         while not stop_event.is_set() and current_epoch < cfg["EPOCHS"]:
-            if check_panic_switches(cfg["MIN_SYS_RAM_GB"]): break
+            # --- SAFETY CHECK ---
+            if check_panic_switches(cfg["MIN_SYS_RAM_GB"]): 
+                logger.critical("SYSTEM SAFETY TRIGGERED: Low Resources. Emergency Shutdown.")
+                break
             
-            # --- LE SCHEDULER DE CONTRÔLE  ---
-            # We use the GUI values as the "Target" (Max) values
-            target_edge = cfg["EDGE_WEIGHT"]
+            # =================================================================
+            # SCHEDULER V6.0: THE "TYPESETTER" RAMP (Fixed Text Signal)
+            # =================================================================
+            # Rationale: 
+            # 1. BANNED Perceptual Loss until Epoch 30. It causes text blurring.
+            # 2. HELD MSE High (100.0) much longer. This forces high contrast.
+            # 3. LINEAR RAMP for Edge Loss. No more "shock" transitions.
+            
+            target_perc = cfg["PERCEPTUAL_WEIGHT"] 
             target_beta = cfg["BETA"]
 
             if current_epoch < 5:
-                # Phase 1: 0% Edge, 1% Beta (Warmup)
-                current_edge_weight = 0.0 
-                current_beta = target_beta * 0.01
-                phase_name = "PHASE 1 (COULEURS)"
-            elif current_epoch < 15:
-                # Phase 2: 50% Edge, 10% Beta
-                current_edge_weight = target_edge * 0.5 
-                current_beta = target_beta * 0.1
-                phase_name = "PHASE 1.5 (BOOST STRUCTURE)"
-            elif current_epoch < 25:
-                # Phase 3: 100% Edge, 50% Beta
-                current_edge_weight = target_edge
-                current_beta = target_beta * 0.5
-                phase_name = "PHASE 2 (STRUCTURE)"
-            elif current_epoch < 130:
-                # Phase 4: 100% Edge, 50% Beta
-                current_edge_weight = 3000.0
-                current_beta = 0.0
-                phase_name = "PHASE 4 (FINISH)"
+                # PHASE 0: BINARY ANCHOR (Pure Contrast)
+                # Forces the model to learn Black vs White pixels immediately.
+                curr_mse, curr_chroma, curr_edge, curr_perc, curr_beta = 300.0, 50.0, 0.0, 0.0, 0.0
+                phase_name = "PHASE 0: ANCHOR"
+
+            elif current_epoch < 30:
+                # PHASE 1: THE TYPESETTER (Linear Edge Ramp)
+                # We ramp Edge loss slowly from 0 -> 150. 
+                # We KEEP MSE at 100.0 to prevent "graying out" of text.
+                # STRICTLY NO PERCEPTUAL LOSS yet.
+                progress = (current_epoch - 5) / 25.0  # 0.0 to 1.0
+                
+                curr_mse = 100.0
+                curr_chroma = 50.0
+                curr_edge = 10.0 + (140.0 * progress) # Ramp: 10 -> 150
+                curr_perc = 0.0 
+                curr_beta = 0.0
+                phase_name = f"PHASE 1: TYPESET (Edge: {curr_edge:.1f})"
+
+            elif current_epoch < 50:
+                # PHASE 2: LATENT ORGANIZATION (Beta Warmup)
+                # Text is now sharp. We slowly introduce Beta to organize the latent space.
+                # We slowly lower MSE to 20 to allow for more artistic freedom later.
+                progress = (current_epoch - 30) / 20.0
+                
+                curr_mse = 100.0 - (80.0 * progress) # Drop: 100 -> 20
+                curr_chroma = 50.0
+                curr_edge = 150.0 # Hold Edge high
+                curr_perc = 0.0   # Still no VGG
+                curr_beta = target_beta * progress # Ramp: 0 -> Target
+                phase_name = "PHASE 2: COMPRESS"
+
             else:
-                # Phase 4: 100% Edge, 100% Beta (Full GUI Settings)
-                current_edge_weight = target_edge
-                current_beta = target_beta
-                
-                # Cap Learning Rate for fine-tuning phase
-                for param_group in optimizer.param_groups:
-                    if param_group['lr'] > 5e-5:
-                        param_group['lr'] = 5e-5
-                phase_name = "PHASE 3 (DETAILS)"
+                # PHASE 3: TEXTURE FILL (VGG Integration)
+                # Text structure is locked in. Now we add VGG to fix blurry backgrounds.
+                curr_mse = 20.0
+                curr_chroma = 50.0
+                curr_edge = 150.0
+                curr_perc = target_perc
+                curr_beta = target_beta
+                phase_name = "PHASE 3: FINAL"
+
+            # --- AMP SAFETY ---
+            # Disable Mixed Precision during Phase 0/1 to prevent NaN on the high MSE
+            use_amp = (current_epoch >= 40)
+
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 0.0001 if current_epoch < 30 else cfg["LEARNING_RATE"]
             
-            # --- CRITICAL FIX: RESET SCHEDULER ON PHASE CHANGE ---
-            # We must re-initialize the scheduler so it forgets the "low loss" from the previous phase.
-            # Otherwise, it compares the new high loss (due to edge weights) to the old low loss and panics.
-            if current_epoch in phases_reset_done and not phases_reset_done[current_epoch]:
-                logger.info(f" >>> [PHASE CHANGE] RESETTING LR & SCHEDULER for Epoch {current_epoch}!")
-                
-                # 1. Reset Learning Rate to a strong value
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = 8e-5
-                
-                # 2. Re-create Scheduler (clears 'best' loss history)
-                scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                    optimizer, mode='min', factor=0.5, patience=5, verbose=True
-                )
-                
-                # 3. Mark as done so we don't do it for every pool in this epoch
-                phases_reset_done[current_epoch] = True
-            
-            # --- LOG HYPERPARAMETERS ---
             current_lr = optimizer.param_groups[0]['lr']
-            logger.info(f"\n--- EPOCH {current_epoch} | {phase_name} ---")
-            logger.info(f" >>> [PARAMS] LR: {current_lr:.6f} | Beta: {current_beta:.6f} | Edge: {current_edge_weight:.1f} | Chroma: {cfg['CHROMA_WEIGHT']}")
-            
-            # --- PHASE A : RAVITAILLEMENT (RAM -> VRAM) ---
+            logger.info(f"\n--- EPOCH {current_epoch} | {phase_name} | AMP: {use_amp} ---")
+
+            # =================================================================
+            # PHASE A : RAVITAILLEMENT (GET DATA FROM RAM -> VRAM)
+            # =================================================================
             try:
-                # Wait for data with timeout to check stop_event
+                # Wait for the background loader thread to provide a data pool
+                res = None
                 while not stop_event.is_set():
                     try:
-                        res = pool_queue.get(timeout=1)
+                        res = pool_queue.get(timeout=2)
                         break
                     except queue.Empty:
                         continue
-                if stop_event.is_set(): break
+                
+                if res is None or stop_event.is_set(): break
                 
                 current_vram_data_cpu, global_file_ptr = res
+                # Crucial: Move to GPU in one block
                 current_vram_data = current_vram_data_cpu.to(device, non_blocking=True)
-                del current_vram_data_cpu
+                del current_vram_data_cpu # Clear CPU memory immediately
             except Exception as e:
-                logger.warning(f"Pipeline wait error: {e}")
+                logger.warning(f"Data Pipeline Error: {e}")
                 continue
 
-            # --- PHASE B : LA COMBUSTION (BURNING) ---
+            # =================================================================
+            # PHASE B : LA COMBUSTION (THE ACTUAL TRAINING LOOP)
+            # =================================================================
             num_pool_samples = len(current_vram_data)
             cycle_loss_accumulator = 0
             cycle_iterations = 0
-            logger.info(f" >>> VRAM CHARGÉE : {num_pool_samples} images. EdgeWeight: {current_edge_weight}")
             
             indices = torch.randperm(num_pool_samples)
             model.train()
             
             for i in range(0, num_pool_samples, cfg["BATCH_SIZE"]):
-                if stop_event.is_set() or check_panic_switches(cfg["MIN_SYS_RAM_GB"]): break
+                if stop_event.is_set(): break
                 
                 batch_indices = indices[i : i + cfg["BATCH_SIZE"]]
                 batch = current_vram_data[batch_indices]
                 
                 if batch.size(0) < 2: continue
 
+                # --- [START ROBUST TRAINING STEP] ---
                 optimizer.zero_grad(set_to_none=True)
                 
-                with torch.amp.autocast('cuda'):
-                    recon, mu, logvar = model(batch)
-                    loss = vae_loss_function(
-                        recon, batch, mu, logvar, 
-                        beta=current_beta, 
-                        edge_weight=current_edge_weight, 
-                        chroma_weight=cfg["CHROMA_WEIGHT"]
-                    )
-
-                if torch.isnan(loss):
-                    logger.error("\n [!] ALERTE : Perte NaN détectée.")
-                    optimizer.zero_grad(set_to_none=True)
-                    continue 
-
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                # On force le Float32 tant qu'on est pas en Phase 3
+                use_amp = (current_epoch >= 41) 
                 
-                scaler.step(optimizer)
-                scaler.update()
+                # 1. Forward Pass
+                if use_amp:
+                    with torch.amp.autocast('cuda'):
+                        recon, mu, logvar = model(batch)
+                        loss = vae_loss_function(recon, batch, mu, logvar, curr_beta, curr_mse, curr_edge, curr_chroma, curr_perc)
+                else:
+                    # Float32 pur pour la stabilité avec les gros poids
+                    recon, mu, logvar = model(batch)
+                    loss = vae_loss_function(recon, batch, mu, logvar, curr_beta, curr_mse, curr_edge, curr_chroma, curr_perc)
+
+                # --- FIX START: Detect Broken Graph ---
+                if loss.item() == 1000.0:
+                    logger.warning(" [!] NaN Detected (Graph Disconnected). Skipping Batch.")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
+                # 2. Backward Pass & Step
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # En Float32, on n'utilise JAMAIS le scaler
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
                 
                 cycle_loss_accumulator += loss.item()
                 cycle_iterations += 1
                 
-                # Send Stats to GUI (Sampled)
-                if cycle_iterations % 10 == 0:
+                # Update GUI with live loss every few steps
+                if cycle_iterations % 20 == 0:
                     status_queue.put({
                         "status": "TRAINING",
                         "epoch": current_epoch,
-                        "iteration": cycle_iterations,
                         "loss": loss.item(),
-                        "lr": optimizer.param_groups[0]['lr'],
-                        "edge_weight": current_edge_weight,  # <--- Added to payload
-                        "beta": current_beta,                # <--- Added to payload
-                        "phase": phase_name
+                        "lr": current_lr,
+                        "perc": curr_perc
                     })
 
-            # --- PHASE C : SYNCHRONISATION ET PERSISTANCE ---
+            # =================================================================
+            # PHASE C : SYNCHRONISATION & PERSISTANCE
+            # =================================================================
             if not stop_event.is_set() and cycle_iterations > 0:
                 avg_pool_loss = cycle_loss_accumulator / cycle_iterations
+                scheduler.step(avg_pool_loss)
                 
-                # Update the GUI with the calculated average loss for this pool
-                status_queue.put({"status": "TRAINING", "loss": avg_pool_loss, "epoch": current_epoch, "iteration": cycle_iterations, "lr": optimizer.param_groups[0]['lr']})
-
-                logger.info(f"\n >>> Cycle Pool OK. Perte Moyenne : {avg_pool_loss:.4f}")
-                
-                # --- LOGIC FIX: MANUAL LR RESET ON PHASE CHANGE ---
-                # If we just entered a new phase (based on epoch), we should BOOST the LR, not lower it.
-                if current_epoch in [5, 15, 25] and pool_counter == 0:
-                    logger.info(" >>> PHASE CHANGE DETECTED: Resetting Learning Rate to 8e-5")
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] = 8e-5
-                    # Reset scheduler to forget the "bad" history
-                    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                        optimizer, mode='min', factor=0.5, patience=5, verbose=True
-                    )
-                else:
-                    # Only step scheduler normally
-                    scheduler.step(avg_pool_loss)
-                
+                # Checkpointing
                 if pool_counter % cfg["CHECKPOINT_EVERY_N_POOLS"] == 0:
                     save_titan_checkpoint(model, optimizer, current_epoch, global_file_ptr, avg_pool_loss, cfg)
                 
+                # Visualization
                 if pool_counter % cfg["VISUALIZE_EVERY_N_POOLS"] == 0:
                     with torch.no_grad():
                         n_viz = min(batch.size(0), 8)
                         visual_comparison = torch.cat([batch[:n_viz], recon[:n_viz]])
                         snap_path = os.path.join(cfg["RESULTS_DIR"], f"v_e{current_epoch}_p{pool_counter}.png")
                         save_image(visual_comparison.cpu(), snap_path, nrow=n_viz)
-                        logger.info(f" [!] Snapshot Visuel généré : {snap_path}")
+                        logger.info(f" [!] Snapshot saved: {snap_path}")
 
-            # --- PHASE D : VIDANGE ET GESTION EPOCH ---
-            del current_vram_data, batch, recon, mu, logvar
-            cleanup_memory()
-            
+            # =================================================================
+            # PHASE D : AGGRESSIVE PURGE & EPOCH MANAGEMENT
+            # =================================================================
+            # 1. Clear GPU variables immediately
+            try:
+                # We target every large tensor that could be lingering
+                del batch, recon, mu, logvar, current_vram_data, loss
+            except NameError:
+                pass 
+
+            # 2. Hard memory reset for ROCm/CUDA stability
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect() # Clears shared memory fragments
+
+            # 3. Epoch increment logic (Check if dataset pointer wrapped)
             if global_file_ptr < last_loop_ptr:
                 current_epoch += 1
-                logger.info(f" >>> [NEW EPOCH] Passage à l'EPOCH {current_epoch}")
+                logger.info(f" >>> [EPOCH ROLLOVER] New Epoch: {current_epoch}")
             
             last_loop_ptr = global_file_ptr
             pool_counter += 1
             
+            # Heartbeat (Indicator that the engine is still alive)
+            with open(os.path.join(cfg["CHECKPOINT_DIR"], "heartbeat.txt"), "w") as f:
+                f.write(f"Epoch: {current_epoch}, Pool: {pool_counter}, Time: {time.time()}")
+            
     except Exception as e:
+        # Emergency Disk Log
+        with open("CRITICAL_CRASH.log", "a") as f:
+            f.write(f"\n[{datetime.now()}] CRASH: {str(e)}\n")
+            f.write(traceback.format_exc())
+        
         logger.error(f"CRITICAL ENGINE FAILURE: {e}")
-        logger.error(traceback.format_exc())
         status_queue.put({"status": "ERROR", "msg": str(e)})
         
     finally:
