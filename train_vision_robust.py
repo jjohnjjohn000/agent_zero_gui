@@ -54,7 +54,7 @@ os.environ['MIOPEN_DEBUG_DISABLE_CONV_ALGO_TYPES'] = '1'
 
 # Injection du chemin projet pour les imports locaux
 current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)
+project_root = current_dir
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
@@ -143,31 +143,45 @@ atexit.register(cleanup_memory)
 
 def load_single_file(args):
     """
-    Travailleur CPU Unitaire. 
-    Note: args est un tuple (filepath, crop_size) pour compatibilité map.
+    SMART LOADER (Universal):
+    - If image is huge (1080p): Randomly crop to 256x256 & Flip BGR->RGB.
+    - If image is 256x256: Use full frame & Keep colors (assumes pre-processed).
     """
     fp, crop_size = args
     try:
         with np.load(fp) as data:
             if 'images' not in data:
                 return None
-            raw_images = data['images']
             
+            # Load data
+            raw_images = data['images'] # Shape: (N, H, W, 3)
             n, h, w, c = raw_images.shape
-            if h < crop_size or w < crop_size:
+            
+            # --- CASE 1: PRE-PROCESSED (New Recorder) ---
+            # The image is already the perfect size (256x256).
+            # We assume new recorder saves RGB, so NO color flipping needed.
+            if h == crop_size and w == crop_size:
+                return raw_images.copy()
+
+            # --- CASE 2: RAW HIGH-RES (Old Recorder) ---
+            # The image is big. We need to crop a 256x256 patch.
+            # We assume old recorder saved raw OpenCV (BGR), so we FLIP to RGB.
+            elif h > crop_size and w > crop_size:
+                # Vectorized Random Cropping
+                y = np.random.randint(0, h - crop_size, size=n)
+                x = np.random.randint(0, w - crop_size, size=n)
+                
+                patches = np.zeros((n, crop_size, crop_size, 3), dtype=np.uint8)
+                for i in range(n):
+                    patches[i] = raw_images[i, y[i]:y[i]+crop_size, x[i]:x[i]+crop_size]
+                
+                # Flip BGR -> RGB for the AI
+                return patches[:, :, :, ::-1].copy()
+            
+            # --- CASE 3: TOO SMALL (Corrupt) ---
+            else:
                 return None
-            
-            # Stratégie de data-augmentation (Crops multiples vectorisés)
-            y = np.random.randint(0, h - crop_size, size=n)
-            x = np.random.randint(0, w - crop_size, size=n)
-            
-            # Allocation d'un bloc contigu pour la rapidité
-            patches = np.zeros((n, crop_size, crop_size, 3), dtype=np.uint8)
-            for i in range(n):
-                patches[i] = raw_images[i, y[i]:y[i]+crop_size, x[i]:x[i]+crop_size]
-            
-            # CORRECTION : Conversion BGR -> RGB et retour
-            return patches[:, :, :, ::-1].copy()
+
     except Exception as e:
         return None
 
@@ -352,7 +366,7 @@ def train_process_entrypoint(status_queue, stop_event, config_overrides):
         logger.info(">>> Lancement du Sanity Check...")
         try:
             dummy = torch.randn(1, 3, cfg["CROP_SIZE"], cfg["CROP_SIZE"]).to(device)
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 recon, mu, logvar = model(dummy)
                 # FIX: Added 9th argument (perceptual_weight=0.0)
                 loss = vae_loss_function(recon, dummy, mu, logvar, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -527,7 +541,7 @@ def train_process_entrypoint(status_queue, stop_event, config_overrides):
                 
                 # 1. Forward Pass
                 if use_amp:
-                    with torch.amp.autocast('cuda'):
+                    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                         recon, mu, logvar = model(batch)
                         loss = vae_loss_function(recon, batch, mu, logvar, curr_beta, curr_mse, curr_edge, curr_chroma, curr_perc)
                 else:

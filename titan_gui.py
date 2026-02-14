@@ -82,7 +82,7 @@ class TitanGUI:
         self.vars = {}
         defaults = {
             "LEARNING_RATE": 0.00005, "BATCH_SIZE": 4, "LATENT_DIM": 4096,
-            "EPOCHS": 150, "PERCEPTUAL_WEIGHT": 2.0, "CHROMA_WEIGHT": 30.0, "BETA": 0.00001
+            "EPOCHS": 170, "PERCEPTUAL_WEIGHT": 2.0, "CHROMA_WEIGHT": 30.0, "BETA": 0.00001
         }
         
         row = 0
