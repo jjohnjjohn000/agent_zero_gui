@@ -1,0 +1,31 @@
+# ==================================================================================
+# TITAN EAR V2 - PRODUCTION DEPENDENCIES
+# ==================================================================================
+
+# Core Audio Processing
+numpy>=1.24.0
+sounddevice>=0.4.6
+scipy>=1.11.0
+
+# AI Models
+torch>=2.0.0
+faster-whisper>=0.10.0
+pyannote.audio>=3.1.0
+speechbrain>=0.5.16
+
+# WebRTC Audio Processing (AEC)
+webrtc-noise-gain>=1.2.3
+
+# System Audio Capture (Linux)
+soundcard>=0.4.2
+pulsectl>=23.5.2
+
+# Voice Activity Detection
+silero-vad>=4.0.0
+
+# Utilities
+colorama>=0.4.6
+pyyaml>=6.0
+
+# Optional: For better performance
+onnxruntime-gpu>=1.16.0  # If you want ONNX acceleration
