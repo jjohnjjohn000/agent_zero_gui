@@ -429,27 +429,31 @@ def train_process_entrypoint(status_queue, stop_event, config_overrides):
                 break
             
             # =================================================================
-            # SCHEDULER V6.0: THE "TYPESETTER" RAMP (Fixed Text Signal)
+            # SCHEDULER V6.1: THE "IRON TYPESETTER" (Text Recovery Mode)
             # =================================================================
-            # Rationale: 
-            # 1. BANNED Perceptual Loss until Epoch 30. It causes text blurring.
-            # 2. HELD MSE High (100.0) much longer. This forces high contrast.
-            # 3. LINEAR RAMP for Edge Loss. No more "shock" transitions.
+            # Strategy:
+            # 1. PHASE 0 (0-5): BINARY LOCK. Forces pixels to be either Page or Ink.
+            # 2. PHASE 1 (5-30): EDGE RAMP. Slowly adds Laplacian loss to sharpen lines.
+            # 3. PHASE 2 (30-50): COMPRESSION. Only NOW do we introduce Beta (KL).
+            # 4. PHASE 3 (50+): TEXTURE. VGG is added last to fix the paper grain.
             
             target_perc = cfg["PERCEPTUAL_WEIGHT"] 
             target_beta = cfg["BETA"]
 
             if current_epoch < 5:
-                # PHASE 0: BINARY ANCHOR (Pure Contrast)
-                # Forces the model to learn Black vs White pixels immediately.
-                curr_mse, curr_chroma, curr_edge, curr_perc, curr_beta = 300.0, 50.0, 0.0, 0.0, 0.0
-                phase_name = "PHASE 0: ANCHOR"
+                # PHASE 0: ANCHOR (Pure Contrast)
+                # We ignore everything except making the pixels the right color.
+                curr_mse = 300.0   # Massive MSE to force black text on white bg
+                curr_chroma = 50.0 # Keep colors correct
+                curr_edge = 0.0
+                curr_perc = 0.0
+                curr_beta = 0.0
+                phase_name = "PHASE 0: ANCHOR (Binary Contrast)"
 
             elif current_epoch < 30:
                 # PHASE 1: THE TYPESETTER (Linear Edge Ramp)
-                # We ramp Edge loss slowly from 0 -> 150. 
-                # We KEEP MSE at 100.0 to prevent "graying out" of text.
-                # STRICTLY NO PERCEPTUAL LOSS yet.
+                # We ramp Edge loss 10 -> 150. MSE stays high (100).
+                # CRITICAL: No Beta yet. Latent space is free to overfit the shapes.
                 progress = (current_epoch - 5) / 25.0  # 0.0 to 1.0
                 
                 curr_mse = 100.0
@@ -461,26 +465,26 @@ def train_process_entrypoint(status_queue, stop_event, config_overrides):
 
             elif current_epoch < 50:
                 # PHASE 2: LATENT ORGANIZATION (Beta Warmup)
-                # Text is now sharp. We slowly introduce Beta to organize the latent space.
-                # We slowly lower MSE to 20 to allow for more artistic freedom later.
+                # Text is sharp. Now we introduce Beta to organize the brain.
+                # MSE lowers slightly but stays firm at 40 (was 20) to prevent blur.
                 progress = (current_epoch - 30) / 20.0
                 
-                curr_mse = 100.0 - (80.0 * progress) # Drop: 100 -> 20
+                curr_mse = 100.0 - (60.0 * progress) # Drop: 100 -> 40 (Safer floor)
                 curr_chroma = 50.0
-                curr_edge = 150.0 # Hold Edge high
+                curr_edge = 150.0 # HOLD THE LINE
                 curr_perc = 0.0   # Still no VGG
                 curr_beta = target_beta * progress # Ramp: 0 -> Target
-                phase_name = "PHASE 2: COMPRESS"
+                phase_name = "PHASE 2: COMPRESS (Beta Injection)"
 
             else:
-                # PHASE 3: TEXTURE FILL (VGG Integration)
-                # Text structure is locked in. Now we add VGG to fix blurry backgrounds.
-                curr_mse = 20.0
+                # PHASE 3: FINAL POLISH (Texture Fill)
+                # Structure is locked. VGG helps with paper texture/backgrounds.
+                curr_mse = 40.0   # Keep this floor higher for text heavy datasets
                 curr_chroma = 50.0
-                curr_edge = 150.0
+                curr_edge = 150.0 # Max edge weight permanently
                 curr_perc = target_perc
                 curr_beta = target_beta
-                phase_name = "PHASE 3: FINAL"
+                phase_name = "PHASE 3: FINAL (Perceptual ON)"
 
             # --- AMP SAFETY ---
             # Disable Mixed Precision during Phase 0/1 to prevent NaN on the high MSE
