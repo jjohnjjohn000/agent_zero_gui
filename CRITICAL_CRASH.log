@@ -1,0 +1,6 @@
+
+[2026-02-14 16:08:33.755842] CRASH: ReduceLROnPlateau.__init__() got an unexpected keyword argument 'verbose'
+Traceback (most recent call last):
+  File "/home/wa/agent_zero_gui/train_vision_robust.py", line 382, in train_process_entrypoint
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+TypeError: ReduceLROnPlateau.__init__() got an unexpected keyword argument 'verbose'
