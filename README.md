@@ -1,4 +1,4 @@
-# 🧠 TITAN AGENT: Autonomous OS Controller (Brutal L1)
+# 🧠 TITAN AGENT: Autonomous OS Controller (Refined Tuning)
 
 > **"We aren't downloading a brain. We are building one."**
 
